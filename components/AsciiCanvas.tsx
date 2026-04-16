@@ -99,6 +99,30 @@ export default function AsciiCanvas() {
   const mouseHistory = useRef<{ x: number; y: number; t: number }[]>([]);
   const lastShake = useRef(0);
 
+  async function toggleCamera() {
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach(t => t.stop());
+      cameraStreamRef.current = null;
+      cameraVideoRef.current = null;
+      cameraOffscreenRef.current = null;
+      setCameraOn(false);
+      return;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+    cameraStreamRef.current = stream;
+
+    const video = document.createElement("video");
+    video.srcObject = stream;
+    video.playsInline = true;
+    video.muted = true;
+    await video.play();
+    cameraVideoRef.current = video;
+
+    const offscreen = document.createElement("canvas");
+    cameraOffscreenRef.current = offscreen;
+    setCameraOn(true);
+  }
+
   async function setupAudio() {
     if (analyserRef.current) return;
 
@@ -386,6 +410,24 @@ export default function AsciiCanvas() {
         }
       }
 
+      // sample camera frame into a pixel grid matching the char grid
+      const dpr = window.devicePixelRatio || 1;
+      const gridCols = Math.floor((canvas.width / dpr) / FONT_SIZE);
+      const gridRows = Math.floor((canvas.height / dpr) / FONT_SIZE);
+      let cameraPixels: Uint8ClampedArray | null = null;
+
+      const camVideo = cameraVideoRef.current;
+      const camOffscreen = cameraOffscreenRef.current;
+      if (camVideo && camOffscreen && camVideo.readyState >= 2) {
+        camOffscreen.width = gridCols;
+        camOffscreen.height = gridRows;
+        const oc = camOffscreen.getContext("2d", { willReadFrequently: true })!;
+        oc.setTransform(-1, 0, 0, 1, gridCols, 0); // mirror horizontally
+        oc.drawImage(camVideo, 0, 0, gridCols, gridRows);
+        oc.setTransform(1, 0, 0, 1, 0, 0); // reset
+        cameraPixels = oc.getImageData(0, 0, gridCols, gridRows).data;
+      }
+
       for (const p of particles.current) {
         const dx = p.x - mx, dy = p.y - my;
         const dist = Math.sqrt(dx*dx + dy*dy);
@@ -423,6 +465,10 @@ export default function AsciiCanvas() {
           const angle = Math.atan2(dy, dx) + p.fleeAngleJitter;
           p.vx += Math.cos(angle)*force*FLEE_FORCE;
           p.vy += Math.sin(angle)*force*FLEE_FORCE;
+        } else if (cameraPixels) {
+          // camera mode: snap back to home, char driven by pixel brightness
+          p.vx += (p.homeX - p.x) * 0.12;
+          p.vy += (p.homeY - p.y) * 0.12;
         } else {
           const waveX =
             Math.sin(t*WAVE_SPEED + p.homeY*WAVE_FREQ_Y) * WAVE_AMP_X +
@@ -570,6 +616,14 @@ export default function AsciiCanvas() {
         className="absolute bottom-6 left-1/2 -translate-x-1/2 text-white/30 hover:text-white/80 transition-colors font-mono text-xs tracking-widest"
       >
         {playing ? "[ pause ]" : "[ play ]"}
+      </button>
+
+      {/* camera toggle */}
+      <button
+        onClick={toggleCamera}
+        className={`absolute top-6 left-1/2 -translate-x-1/2 font-mono text-xs tracking-widest transition-colors ${cameraOn ? "text-white/80" : "text-white/25 hover:text-white/60"}`}
+      >
+        {cameraOn ? "[ cam on ]" : "[ cam ]"}
       </button>
 
       {/* knob panel */}
