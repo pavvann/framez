@@ -7,6 +7,11 @@ class BeatDetectorProcessor extends AudioWorkletProcessor {
     this._fluxThreshold = 0.05;
     this._rmsMultiplier = 1.5;
 
+    // one-pole low-pass filter state — isolates kick frequencies (~150 Hz)
+    // α = 2π × fc / (2π × fc + fs), fc=150Hz, fs=44100Hz ≈ 0.021
+    this._lpAlpha = 0.021;
+    this._lpPrev = 0;
+
     this.port.onmessage = (e) => {
       if (e.data.fluxThreshold !== undefined) this._fluxThreshold = e.data.fluxThreshold;
       if (e.data.rmsMultiplier !== undefined) this._rmsMultiplier = e.data.rmsMultiplier;
@@ -25,11 +30,16 @@ class BeatDetectorProcessor extends AudioWorkletProcessor {
         if (input[ch]) output[ch].set(input[ch]);
       }
 
-      // RMS of this 128-sample block
+      // low-pass filter then compute RMS — only bass energy triggers kicks
+      const a = this._lpAlpha;
+      let lpState = this._lpPrev;
       let sum = 0;
       for (let i = 0; i < samples.length; i++) {
-        sum += samples[i] * samples[i];
+        lpState = a * samples[i] + (1 - a) * lpState;
+        sum += lpState * lpState;
       }
+      this._lpPrev = lpState;
+
       const rms = Math.sqrt(sum / samples.length);
 
       // flux = positive rise only — catches onset, not sustained energy
@@ -40,8 +50,6 @@ class BeatDetectorProcessor extends AudioWorkletProcessor {
       if (this._cooldown > 0) {
         this._cooldown--;
       } else if (flux > this._fluxThreshold && rms > this._avgRms * this._rmsMultiplier) {
-        // high flux threshold + must be louder than recent average
-        // cooldown: 20 blocks * 128 / 44100 ≈ 58ms (filters out snares/hats that follow kicks)
         this._cooldown = 20;
         this.port.postMessage({ type: 'kick' });
       }

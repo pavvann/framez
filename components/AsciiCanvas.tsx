@@ -57,6 +57,11 @@ export default function AsciiCanvas() {
   const freqDataRef = useRef<Uint8Array | null>(null);
   const timeDomainRef = useRef<Uint8Array | null>(null);
   const bassRef = useRef(0);
+  // drop detection — just track kick gaps
+  const lastKickFrameRef = useRef(0);
+  // debug display
+  const [debugInfo, setDebugInfo] = useState({ gap: 0, inGap: false });
+  const debugTickRef = useRef(0);
   const songSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
   const muteGainRef = useRef<GainNode | null>(null);
 
@@ -93,6 +98,9 @@ export default function AsciiCanvas() {
   const [laserColor, setLaserColor] = useState<[number, number, number]>([255, 20, 20]);
   const [laserChance, setLaserChance] = useState(0.05);
   const laserChanceRef = useRef(0.05);
+  // manual BPM — used to quantize laser duration to bars
+  const [bpm, setBpm] = useState(128);
+  const bpmRef = useRef(128);
   function pickLaserColor(rgb: [number, number, number]) {
     laserColorRef.current = rgb;
     setLaserColor(rgb);
@@ -431,16 +439,47 @@ export default function AsciiCanvas() {
       bassRef.current = bassRef.current * 0.6 + rawBass * 0.4;
       const bass = bassRef.current;
 
+      // --- drop detection: kick gap tracking ---
+      // how many frames since the last kick?
+      const kickGap = t - lastKickFrameRef.current;
+      const kickGapSec = kickGap / 60;
+      const inGap = kickGap > 90; // ~1.5s without a kick = breakdown
+
+      // update debug overlay
+      debugTickRef.current++;
+      if (debugTickRef.current % 30 === 0) {
+        setDebugInfo({ gap: Math.round(kickGapSec * 10) / 10, inGap });
+      }
+
       // kick detection handled by AudioWorklet at 2.9ms resolution
       const kickFired = pendingKickRef.current;
       if (kickFired) {
         pendingKickRef.current = false;
         kickFlashRef.current = 1.0;
 
-        if (!laserRef.current && Math.random() < laserChanceRef.current) {
+        // drop = first kick after a real gap (kicks were absent >1.5s)
+        const isDrop = inGap && t > 180; // skip first 3s of track
+
+        lastKickFrameRef.current = t;
+
+        if (isDrop && !laserRef.current) {
+          // always fire on a drop
           const count = 3 + Math.floor(Math.random() * 5);
           laserRef.current = {
-            frames: 120 + Math.floor(Math.random() * 120),
+            frames: Math.round(((60 / bpmRef.current) * [1, 2, 2, 4][Math.floor(Math.random() * 4)]) * 60),
+            total: 0,
+            beams: Array.from({ length: count }, () => ({
+              x: Math.random() * window.innerWidth,
+              width: 1 + Math.random() * 2,
+              drift: (Math.random() - 0.5) * window.innerWidth * 0.6,
+            })),
+            strobePhase: 0,
+          };
+        } else if (!isDrop && !laserRef.current && Math.random() < laserChanceRef.current) {
+          // fallback: probabilistic on regular kicks
+          const count = 3 + Math.floor(Math.random() * 5);
+          laserRef.current = {
+            frames: Math.round(((60 / bpmRef.current) * [1, 2, 2, 4][Math.floor(Math.random() * 4)]) * 60),
             total: 0,
             beams: Array.from({ length: count }, () => ({
               x: Math.random() * window.innerWidth,
@@ -725,6 +764,14 @@ export default function AsciiCanvas() {
     <div className="relative w-full h-full">
       <canvas ref={canvasRef} className="block w-full h-full" />
 
+      {/* drop detection debug — remove when tuned */}
+      <div className="absolute top-6 left-6 font-mono text-[10px] text-white/50 space-y-0.5 pointer-events-none">
+        <div>kick gap: {debugInfo.gap}s</div>
+        <div className={debugInfo.inGap ? "text-yellow-400/80" : ""}>
+          {debugInfo.inGap ? "▼ no kicks (drop next)" : "kicks active"}
+        </div>
+      </div>
+
       {/* play/pause */}
       <button
         onClick={togglePlay}
@@ -807,6 +854,14 @@ export default function AsciiCanvas() {
           max={0.3}
           decimals={2}
           onChange={(v) => { laserChanceRef.current = v; setLaserChance(v); }}
+        />
+        <Knob
+          label="bpm"
+          value={bpm}
+          min={60}
+          max={200}
+          decimals={0}
+          onChange={(v) => { bpmRef.current = Math.round(v); setBpm(Math.round(v)); }}
         />
       </div>
     </div>
