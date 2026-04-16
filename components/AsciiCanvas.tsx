@@ -57,6 +57,8 @@ export default function AsciiCanvas() {
   const freqDataRef = useRef<Uint8Array | null>(null);
   const timeDomainRef = useRef<Uint8Array | null>(null);
   const bassRef = useRef(0);
+  const songSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const muteGainRef = useRef<GainNode | null>(null);
 
   // beat detection
   const kickFlashRef = useRef(0);
@@ -69,9 +71,32 @@ export default function AsciiCanvas() {
   const smoothedSpecRef = useRef<Float32Array | null>(null);
   const pendingKickRef = useRef(false);
 
+  // live audio (BlackHole / mic)
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveSrcRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveOnRef = useRef(false);
+  const [liveOn, setLiveOn] = useState(false);
+  const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
+  const [showDevicePicker, setShowDevicePicker] = useState(false);
+
   // lasers
   interface Laser { frames: number; total: number; beams: { x: number; width: number; drift: number }[]; strobePhase: number; }
   const laserRef = useRef<Laser | null>(null);
+  const LASER_PRESETS: { name: string; rgb: [number, number, number] }[] = [
+    { name: "red",    rgb: [255, 20, 20] },
+    { name: "purple", rgb: [180, 0, 255] },
+    { name: "green",  rgb: [0, 255, 60] },
+    { name: "cyan",   rgb: [0, 200, 255] },
+    { name: "pink",   rgb: [255, 20, 180] },
+  ];
+  const laserColorRef = useRef<[number, number, number]>([255, 20, 20]);
+  const [laserColor, setLaserColor] = useState<[number, number, number]>([255, 20, 20]);
+  const [laserChance, setLaserChance] = useState(0.05);
+  const laserChanceRef = useRef(0.05);
+  function pickLaserColor(rgb: [number, number, number]) {
+    laserColorRef.current = rgb;
+    setLaserColor(rgb);
+  }
 
   // camera
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -123,18 +148,12 @@ export default function AsciiCanvas() {
     setCameraOn(true);
   }
 
-  async function setupAudio() {
-    if (analyserRef.current) return;
-
-    const audio = new Audio("/song.mp3");
-    audio.loop = true;
-    audioRef.current = audio;
+  async function setupAudioContext() {
+    if (audioCtxRef.current) return;
 
     const audioCtx = new AudioContext();
     audioCtxRef.current = audioCtx;
     await audioCtx.resume();
-
-    const source = audioCtx.createMediaElementSource(audio);
 
     // AudioWorklet runs in the audio rendering thread — 128-sample blocks
     // gives us 2.9ms max detection latency instead of 16ms with rAF
@@ -149,13 +168,100 @@ export default function AsciiCanvas() {
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.8;
 
-    source.connect(worklet);
+    // mute gain — used during live mode so desktop audio isn't re-output to speakers
+    const muteGain = audioCtx.createGain();
+    muteGain.gain.value = 0;
+    muteGain.connect(audioCtx.destination);
+    muteGainRef.current = muteGain;
+
     worklet.connect(analyser);
-    analyser.connect(audioCtx.destination);
+    analyser.connect(audioCtx.destination); // song mode: audio reaches speakers
 
     analyserRef.current = analyser;
     freqDataRef.current = new Uint8Array(analyser.frequencyBinCount);
     timeDomainRef.current = new Uint8Array(analyser.fftSize);
+  }
+
+  async function setupAudio() {
+    await setupAudioContext();
+    if (audioRef.current) return;
+
+    const audio = new Audio("/song.mp3");
+    audio.loop = true;
+    audioRef.current = audio;
+
+    const src = audioCtxRef.current!.createMediaElementSource(audio);
+    songSrcRef.current = src;
+    src.connect(workletRef.current!);
+  }
+
+  async function startLive(deviceId?: string) {
+    setShowDevicePicker(false);
+    await setupAudioContext();
+
+    // lazily create muteGain if missing (handles hot-reload ref reset)
+    if (!muteGainRef.current && audioCtxRef.current) {
+      const muteGain = audioCtxRef.current.createGain();
+      muteGain.gain.value = 0;
+      muteGain.connect(audioCtxRef.current.destination);
+      muteGainRef.current = muteGain;
+    }
+
+    // mute speakers so desktop audio isn't doubled
+    try { analyserRef.current!.disconnect(audioCtxRef.current!.destination); } catch {}
+    analyserRef.current!.connect(muteGainRef.current!);
+
+    // disconnect song source to avoid mixing with live signal
+    songSrcRef.current?.disconnect();
+    if (audioRef.current && !audioRef.current.paused) {
+      audioRef.current.pause();
+      setPlaying(false);
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+    });
+    liveStreamRef.current = stream;
+
+    const liveSrc = audioCtxRef.current!.createMediaStreamSource(stream);
+    liveSrcRef.current = liveSrc;
+    liveSrc.connect(workletRef.current!);
+
+    liveOnRef.current = true;
+    setLiveOn(true);
+  }
+
+  async function toggleLive() {
+    if (liveOnRef.current) {
+      // turn off — stop stream, restore song path
+      liveStreamRef.current?.getTracks().forEach(t => t.stop());
+      liveStreamRef.current = null;
+      liveSrcRef.current?.disconnect();
+      liveSrcRef.current = null;
+
+      // reconnect song source and restore audio output to speakers
+      songSrcRef.current?.connect(workletRef.current!);
+      try { analyserRef.current?.disconnect(muteGainRef.current!); } catch {}
+      analyserRef.current?.connect(audioCtxRef.current!.destination);
+
+      liveOnRef.current = false;
+      setLiveOn(false);
+      return;
+    }
+
+    // request mic permission first so device labels are populated
+    await navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(s => s.getTracks().forEach(t => t.stop()))
+      .catch(() => {});
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter(d => d.kind === "audioinput");
+
+    if (inputs.length <= 1) {
+      await startLive(inputs[0]?.deviceId);
+    } else {
+      setAudioInputs(inputs);
+      setShowDevicePicker(true);
+    }
   }
 
   const onFluxChange = useCallback((v: number) => {
@@ -305,6 +411,7 @@ export default function AsciiCanvas() {
     }
 
     function checkIdle() {
+      if (liveOnRef.current) return;
       if (audioRef.current && !audioRef.current.paused) return;
       if (!idleChecked.current && Date.now() - lastMouseMove.current > 8000) {
         idleChecked.current = true;
@@ -330,16 +437,14 @@ export default function AsciiCanvas() {
         pendingKickRef.current = false;
         kickFlashRef.current = 1.0;
 
-        // ~25% chance on a kick to fire lasers (skip if already running)
-        if (!laserRef.current && Math.random() < 0.12) {
+        if (!laserRef.current && Math.random() < laserChanceRef.current) {
           const count = 3 + Math.floor(Math.random() * 5);
           laserRef.current = {
-            frames: 120 + Math.floor(Math.random() * 120), // 2-4 seconds
+            frames: 120 + Math.floor(Math.random() * 120),
             total: 0,
             beams: Array.from({ length: count }, () => ({
               x: Math.random() * window.innerWidth,
               width: 1 + Math.random() * 2,
-              // angle offset at bottom: how far the beam drifts horizontally across screen height
               drift: (Math.random() - 0.5) * window.innerWidth * 0.6,
             })),
             strobePhase: 0,
@@ -505,7 +610,11 @@ export default function AsciiCanvas() {
           const vis = Math.min(255, 80 + Math.floor(luma * 175) + Math.floor(speed * 10) + kickGlow);
 
           if (laserStrobeOn) {
-            ctx.fillStyle = `rgb(30,${Math.floor(vis * 0.6)},${vis})`;
+            const [lr, lg, lb] = laserColorRef.current;
+            const cr = Math.min(255, 30 + Math.floor((vis - 30) * (lr / 255)));
+            const cg = Math.min(255, 30 + Math.floor((vis - 30) * (lg / 255)));
+            const cb = Math.min(255, 30 + Math.floor((vis - 30) * (lb / 255)));
+            ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
           } else {
             ctx.fillStyle = `rgb(${vis},${vis},${vis})`;
           }
@@ -527,7 +636,11 @@ export default function AsciiCanvas() {
             ctx.fillStyle = "black";
           } else if (laserStrobeOn) {
             const brightness = Math.min(255, 130 + Math.floor(speed*12) + kickGlow + bassGlow);
-            ctx.fillStyle = `rgb(30,${Math.floor(brightness * 0.6)},${brightness})`;
+            const [lr, lg, lb] = laserColorRef.current;
+            const cr = Math.min(255, 30 + Math.floor((brightness - 30) * (lr / 255)));
+            const cg = Math.min(255, 30 + Math.floor((brightness - 30) * (lg / 255)));
+            const cb = Math.min(255, 30 + Math.floor((brightness - 30) * (lb / 255)));
+            ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
           } else {
             const brightness = Math.min(255, 130 + Math.floor(speed*12) + kickGlow + bassGlow);
             ctx.fillStyle = `rgb(${brightness},${brightness},${brightness})`;
@@ -548,19 +661,20 @@ export default function AsciiCanvas() {
           const fadeOut = Math.min(1, laser.frames / 30);
 
           if (laserStrobeOn) {
+            const [lr, lg, lb] = laserColorRef.current;
             const h = window.innerHeight;
             ctx.save();
-            ctx.shadowColor = "#ff0000";
+            ctx.shadowColor = `rgb(${lr},${lg},${lb})`;
             ctx.shadowBlur = 18;
 
             for (const beam of laser.beams) {
               const x2 = beam.x + beam.drift;
 
-              // core beam — bright red
+              // core beam
               ctx.beginPath();
               ctx.moveTo(beam.x, 0);
               ctx.lineTo(x2, h);
-              ctx.strokeStyle = `rgba(255, 20, 20, ${0.9 * fadeOut})`;
+              ctx.strokeStyle = `rgba(${lr},${lg},${lb},${0.9 * fadeOut})`;
               ctx.lineWidth = beam.width;
               ctx.stroke();
 
@@ -568,7 +682,7 @@ export default function AsciiCanvas() {
               ctx.beginPath();
               ctx.moveTo(beam.x, 0);
               ctx.lineTo(x2, h);
-              ctx.strokeStyle = `rgba(255, 0, 0, ${0.12 * fadeOut})`;
+              ctx.strokeStyle = `rgba(${lr},${lg},${lb},${0.12 * fadeOut})`;
               ctx.lineWidth = beam.width * 10;
               ctx.stroke();
             }
@@ -603,6 +717,7 @@ export default function AsciiCanvas() {
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("keydown", onKeyDown);
       audioRef.current?.pause();
+      liveStreamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
@@ -618,16 +733,57 @@ export default function AsciiCanvas() {
         {playing ? "[ pause ]" : "[ play ]"}
       </button>
 
-      {/* camera toggle */}
-      <button
-        onClick={toggleCamera}
-        className={`absolute top-6 left-1/2 -translate-x-1/2 font-mono text-xs tracking-widest transition-colors ${cameraOn ? "text-white/80" : "text-white/25 hover:text-white/60"}`}
-      >
-        {cameraOn ? "[ cam on ]" : "[ cam ]"}
-      </button>
+      {/* camera + live toggles */}
+      <div className="absolute top-6 left-1/2 -translate-x-1/2 flex gap-6 items-start">
+        <button
+          onClick={toggleCamera}
+          className={`font-mono text-xs tracking-widest transition-colors ${cameraOn ? "text-white/80" : "text-white/25 hover:text-white/60"}`}
+        >
+          {cameraOn ? "[ cam on ]" : "[ cam ]"}
+        </button>
+        <div className="flex flex-col items-center gap-1">
+          <button
+            onClick={toggleLive}
+            className={`font-mono text-xs tracking-widest transition-colors ${liveOn ? "text-red-400/90" : "text-white/25 hover:text-white/60"}`}
+          >
+            {liveOn ? "[ live on ]" : "[ live ]"}
+          </button>
+          {showDevicePicker && (
+            <div className="flex flex-col gap-1 mt-1">
+              {audioInputs.map(d => (
+                <button
+                  key={d.deviceId}
+                  onClick={() => startLive(d.deviceId)}
+                  className="font-mono text-[10px] tracking-widest text-white/50 hover:text-white/90 transition-colors text-left"
+                >
+                  {d.label || `input ${d.deviceId.slice(0, 6)}`}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* knob panel */}
       <div className="absolute bottom-6 right-8 flex gap-6 items-end">
+        {/* laser color presets */}
+        <div className="flex flex-col items-center gap-2 mb-1">
+          <div className="flex gap-2">
+            {LASER_PRESETS.map(p => {
+              const [r, g, b] = p.rgb;
+              const active = laserColor[0] === r && laserColor[1] === g && laserColor[2] === b;
+              return (
+                <button
+                  key={p.name}
+                  onClick={() => pickLaserColor(p.rgb)}
+                  style={{ background: `rgb(${r},${g},${b})`, boxShadow: active ? `0 0 8px rgb(${r},${g},${b})` : "none" }}
+                  className={`w-3 h-3 rounded-full transition-all ${active ? "scale-125" : "opacity-40 hover:opacity-80"}`}
+                />
+              );
+            })}
+          </div>
+          <span className="font-mono text-white/30 text-[9px] tracking-[0.2em] uppercase">laser</span>
+        </div>
         <Knob
           label="sensitivity"
           value={fluxThreshold}
@@ -643,6 +799,14 @@ export default function AsciiCanvas() {
           max={3.0}
           decimals={2}
           onChange={onRmsChange}
+        />
+        <Knob
+          label="laser freq"
+          value={laserChance}
+          min={0}
+          max={0.3}
+          decimals={2}
+          onChange={(v) => { laserChanceRef.current = v; setLaserChance(v); }}
         />
       </div>
     </div>
