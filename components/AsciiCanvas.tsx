@@ -69,6 +69,19 @@ export default function AsciiCanvas() {
   const smoothedSpecRef = useRef<Float32Array | null>(null);
   const pendingKickRef = useRef(false);
 
+  // lasers
+  interface Laser { frames: number; total: number; beams: { x: number; width: number; drift: number }[]; strobePhase: number; }
+  const laserRef = useRef<Laser | null>(null);
+
+  // camera
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraOffscreenRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const [cameraOn, setCameraOn] = useState(false);
+
+  // brightness-ordered chars for camera (light → dense)
+  const DENSITY = " .,:;|!(){}[]?/\\*&#@";
+
   const [playing, setPlaying] = useState(false);
 
   // easter egg state
@@ -288,11 +301,26 @@ export default function AsciiCanvas() {
       const bass = bassRef.current;
 
       // kick detection handled by AudioWorklet at 2.9ms resolution
-      // pendingKickRef is set from the audio rendering thread via postMessage
       const kickFired = pendingKickRef.current;
       if (kickFired) {
         pendingKickRef.current = false;
         kickFlashRef.current = 1.0;
+
+        // ~25% chance on a kick to fire lasers (skip if already running)
+        if (!laserRef.current && Math.random() < 0.12) {
+          const count = 3 + Math.floor(Math.random() * 5);
+          laserRef.current = {
+            frames: 120 + Math.floor(Math.random() * 120), // 2-4 seconds
+            total: 0,
+            beams: Array.from({ length: count }, () => ({
+              x: Math.random() * window.innerWidth,
+              width: 1 + Math.random() * 2,
+              // angle offset at bottom: how far the beam drifts horizontally across screen height
+              drift: (Math.random() - 0.5) * window.innerWidth * 0.6,
+            })),
+            strobePhase: 0,
+          };
+        }
       }
 
       kickFlashRef.current *= 0.75;
@@ -330,6 +358,14 @@ export default function AsciiCanvas() {
       if (bh) { bh.frames--; if (bh.frames <= 0) blackholeMode.current = null; }
 
       const kickFlash = kickFlashRef.current;
+
+      // compute laser strobe state here so particle colors and beam drawing use the same value
+      const laser = laserRef.current;
+      let laserStrobeOn = false;
+      if (laser) {
+        laser.strobePhase++;
+        laserStrobeOn = laser.strobePhase % 5 < 3;
+      }
 
       const cx = window.innerWidth / 2;
       const cy = window.innerHeight / 2;
@@ -403,28 +439,97 @@ export default function AsciiCanvas() {
         p.x += p.vx;
         p.y += p.vy;
 
-        p.charTimer--;
-        if (p.charTimer <= 0) {
-          if (!invertMode.current) p.char = randomChar();
-          p.charTimer = isMatrix || isChaos ? 3 : p.charInterval;
-        }
+        // camera: override char and color with pixel data
+        if (cameraPixels) {
+          const col = Math.min(gridCols - 1, Math.floor(p.homeX / FONT_SIZE));
+          const row = Math.min(gridRows - 1, Math.floor(p.homeY / FONT_SIZE));
+          const idx = (row * gridCols + col) * 4;
+          const r = cameraPixels[idx];
+          const g2 = cameraPixels[idx + 1];
+          const b2 = cameraPixels[idx + 2];
+          const luma = (r * 0.299 + g2 * 0.587 + b2 * 0.114) / 255;
 
-        const speed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
-        const kickGlow = Math.floor(kickFlash * 120);
-        const bassGlow = Math.floor(bass * 60);
+          // map luma to char — higher brightness = denser char
+          const charIdx = Math.min(DENSITY.length - 1, Math.floor(luma * DENSITY.length));
+          p.char = DENSITY[charIdx];
 
-        if (isMatrix) {
-          const g = Math.min(255, 80 + Math.floor(speed*20) + kickGlow + bassGlow);
-          ctx.fillStyle = `rgb(0,${g},0)`;
-        } else if (isInvert) {
-          ctx.fillStyle = "black";
+          // always render bright enough to see — scale from 80 to 255 based on luma
+          const speed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
+          const kickGlow = Math.floor(kickFlash * 100);
+          const vis = Math.min(255, 80 + Math.floor(luma * 175) + Math.floor(speed * 10) + kickGlow);
+
+          if (laserStrobeOn) {
+            ctx.fillStyle = `rgb(30,${Math.floor(vis * 0.6)},${vis})`;
+          } else {
+            ctx.fillStyle = `rgb(${vis},${vis},${vis})`;
+          }
         } else {
-          const brightness = Math.min(255, 130 + Math.floor(speed*12) + kickGlow + bassGlow);
-          ctx.fillStyle = `rgb(${brightness},${brightness},${brightness})`;
+          p.charTimer--;
+          if (p.charTimer <= 0) {
+            if (!invertMode.current) p.char = randomChar();
+            p.charTimer = isMatrix || isChaos ? 3 : p.charInterval;
+          }
+
+          const speed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
+          const kickGlow = Math.floor(kickFlash * 120);
+          const bassGlow = Math.floor(bass * 60);
+
+          if (isMatrix) {
+            const g = Math.min(255, 80 + Math.floor(speed*20) + kickGlow + bassGlow);
+            ctx.fillStyle = `rgb(0,${g},0)`;
+          } else if (isInvert) {
+            ctx.fillStyle = "black";
+          } else if (laserStrobeOn) {
+            const brightness = Math.min(255, 130 + Math.floor(speed*12) + kickGlow + bassGlow);
+            ctx.fillStyle = `rgb(30,${Math.floor(brightness * 0.6)},${brightness})`;
+          } else {
+            const brightness = Math.min(255, 130 + Math.floor(speed*12) + kickGlow + bassGlow);
+            ctx.fillStyle = `rgb(${brightness},${brightness},${brightness})`;
+          }
         }
 
         ctx.font = `${FONT_SIZE}px monospace`;
         ctx.fillText(p.char, p.x, p.y);
+      }
+
+      // --- lasers ---
+      if (laser) {
+        laser.frames--;
+
+        if (laser.frames <= 0) {
+          laserRef.current = null;
+        } else {
+          const fadeOut = Math.min(1, laser.frames / 30);
+
+          if (laserStrobeOn) {
+            const h = window.innerHeight;
+            ctx.save();
+            ctx.shadowColor = "#ff0000";
+            ctx.shadowBlur = 18;
+
+            for (const beam of laser.beams) {
+              const x2 = beam.x + beam.drift;
+
+              // core beam — bright red
+              ctx.beginPath();
+              ctx.moveTo(beam.x, 0);
+              ctx.lineTo(x2, h);
+              ctx.strokeStyle = `rgba(255, 20, 20, ${0.9 * fadeOut})`;
+              ctx.lineWidth = beam.width;
+              ctx.stroke();
+
+              // wider soft glow
+              ctx.beginPath();
+              ctx.moveTo(beam.x, 0);
+              ctx.lineTo(x2, h);
+              ctx.strokeStyle = `rgba(255, 0, 0, ${0.12 * fadeOut})`;
+              ctx.lineWidth = beam.width * 10;
+              ctx.stroke();
+            }
+
+            ctx.restore();
+          }
+        }
       }
 
       rafRef.current = requestAnimationFrame(tick);
