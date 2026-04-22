@@ -54,8 +54,8 @@ export default function AsciiCanvas() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const freqDataRef = useRef<Uint8Array | null>(null);
-  const timeDomainRef = useRef<Uint8Array | null>(null);
+  const freqDataRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
+  const timeDomainRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
   const bassRef = useRef(0);
   // drop detection — just track kick gaps
   const lastKickFrameRef = useRef(0);
