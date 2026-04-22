@@ -45,6 +45,7 @@ next-env.d.ts
 *.mp3
 *.wav
 *.ogg
+!public/song.mp3
 
 # notes / plans
 /markdowns

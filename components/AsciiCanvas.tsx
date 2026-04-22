@@ -99,8 +99,8 @@ export default function AsciiCanvas() {
   const [laserChance, setLaserChance] = useState(0.05);
   const laserChanceRef = useRef(0.05);
   // manual BPM — used to quantize laser duration to bars
-  const [bpm, setBpm] = useState(128);
-  const bpmRef = useRef(128);
+  const [bpm, setBpm] = useState(146);
+  const bpmRef = useRef(146);
 
   // pillars — 4 vertical strobing columns in a C shape (2 front, 2 back)
   interface PillarBurst { frames: number; pillars: { x: number; width: number; back: boolean }[]; strobePhase: number; }
